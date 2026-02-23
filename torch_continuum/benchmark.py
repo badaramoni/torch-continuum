@@ -1,23 +1,20 @@
-"""Built-in benchmarking tool."""
+"""Built-in benchmarking tool.
+
+Compares baseline PyTorch (all flags off) against torch-continuum
+on the same model and input. Reports wall-clock time and peak memory.
+"""
 
 import time
 import copy
-import base64 as _b64
-import torch as _t
-import torch.nn as _nn
+import torch
+import torch.nn as nn
 from typing import Tuple
 from .device import detect_device
 
-_RK = [_b64.b64decode(s).decode() for s in [
-    b"YmFja2VuZHMuY3VkYS5tYXRtdWwuYWxsb3dfdGYzMg==",
-    b"YmFja2VuZHMuY3Vkbm4uYWxsb3dfdGYzMg==",
-    b"YmFja2VuZHMuY3Vkbm4uYmVuY2htYXJr",
-]]
-
 
 def benchmark(
-    model: _nn.Module,
-    example_input: _t.Tensor,
+    model: nn.Module,
+    example_input: torch.Tensor,
     *,
     level: str = "fast",
     warmup: int = 10,
@@ -45,18 +42,18 @@ def benchmark(
 
     if verbose:
         print("[torch-continuum benchmark]")
-        print(f"  model params : {_np(model):,}")
+        print(f"  model params : {_count_params(model):,}")
         print(f"  input shape  : {tuple(example_input.shape)}")
         print(f"  device       : {device}")
         print(f"  iters        : {iters}  (warmup {warmup})")
         print()
 
-    _rd()
+    _reset_defaults()
     m_base = copy.deepcopy(model).to(device)
-    t_base, mem_base = _tr(m_base, example_input, warmup, iters, backward)
+    t_base, mem_base = _timed_run(m_base, example_input, warmup, iters, backward)
     results["baseline"] = {"time_s": t_base, "peak_mem_mb": mem_base}
 
-    _rd()
+    _reset_defaults()
     from .optimizer import optimize as _opt
     from . import optimizer as _om
     _om._state["level"] = None
@@ -64,10 +61,10 @@ def benchmark(
     _opt(level=level, verbose=False)
 
     m_tc = copy.deepcopy(model).to(device)
-    if level == "max" and hasattr(_t, "compile"):
-        cm = "default" if backward else "reduce-overhead"
-        m_tc = _t.compile(m_tc, mode=cm, dynamic=True)
-    t_tc, mem_tc = _tr(m_tc, example_input, warmup, iters, backward)
+    if level == "max" and hasattr(torch, "compile"):
+        compile_mode = "default" if backward else "reduce-overhead"
+        m_tc = torch.compile(m_tc, mode=compile_mode, dynamic=True)
+    t_tc, mem_tc = _timed_run(m_tc, example_input, warmup, iters, backward)
     results["torch-continuum"] = {"time_s": t_tc, "peak_mem_mb": mem_tc}
 
     if verbose:
@@ -82,42 +79,50 @@ def benchmark(
     return results
 
 
-def _np(m):
+def _count_params(m: nn.Module) -> int:
     return sum(p.numel() for p in m.parameters())
 
 
-def _ra(attr, val):
-    parts = attr.split(".")
-    obj = _t
-    for p in parts[:-1]:
-        obj = getattr(obj, p)
-    setattr(obj, parts[-1], val)
+def _reset_defaults():
+    """Reset to pure eager defaults — all acceleration off."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
 
 
-def _rd():
-    for k in _RK:
-        _ra(k, False)
+def _timed_run(
+    model: nn.Module,
+    x: torch.Tensor,
+    warmup: int,
+    iters: int,
+    backward: bool,
+) -> Tuple[float, float]:
+    is_cuda = x.device.type == "cuda"
 
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
 
-def _tr(model, x, warmup, iters, backward) -> Tuple[float, float]:
-    ic = x.device.type == "cuda"
-    if ic:
-        _t.cuda.reset_peak_memory_stats()
-        _t.cuda.synchronize()
     for _ in range(warmup):
-        o = model(x)
+        out = model(x)
         if backward:
-            o.sum().backward()
-    if ic:
-        _t.cuda.synchronize()
-        _t.cuda.reset_peak_memory_stats()
-    s = time.perf_counter()
+            out.sum().backward()
+
+    if is_cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+    start = time.perf_counter()
     for _ in range(iters):
-        o = model(x)
+        out = model(x)
         if backward:
-            o.sum().backward()
-    if ic:
-        _t.cuda.synchronize()
-    e = time.perf_counter() - s
-    pm = _t.cuda.max_memory_allocated() / 1e6 if ic else 0.0
-    return e, pm
+            out.sum().backward()
+    if is_cuda:
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    peak_mem = 0.0
+    if is_cuda:
+        peak_mem = torch.cuda.max_memory_allocated() / 1e6
+
+    return elapsed, peak_mem

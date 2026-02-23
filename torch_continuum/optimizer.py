@@ -1,25 +1,15 @@
-"""Continuum optimization engine."""
+"""Continuum optimization engine.
 
-import os as _os
-import base64 as _b64
-import torch as _t
+Detects hardware capabilities and applies the right PyTorch settings
+for your GPU. Three levels: safe (no precision change), fast (accelerated
+matmul), max (mixed precision + fused kernels + compilation).
+"""
+
+import os
+import torch
 from .device import detect_device, DeviceInfo
 
 _state = {"level": None, "device": None, "applied": 0}
-
-_P = [
-    _b64.b64decode(s).decode() for s in [
-        b"YmFja2VuZHMuY3Vkbm4uYmVuY2htYXJr",
-        b"YmFja2VuZHMuY3VkYS5lbmFibGVfZmxhc2hfc2Rw",
-        b"YmFja2VuZHMuY3VkYS5lbmFibGVfbWVtX2VmZmljaWVudF9zZHA=",
-        b"YmFja2VuZHMuY3VkYS5tYXRtdWwuYWxsb3dfdGYzMg==",
-        b"YmFja2VuZHMuY3Vkbm4uYWxsb3dfdGYzMg==",
-    ]
-]
-_E = [_b64.b64decode(s).decode() for s in [
-    b"UFlUT1JDSF9DVURBX0FMTE9DX0NPTkY=",
-    b"ZXhwYW5kYWJsZV9zZWdtZW50czpUcnVl",
-]]
 
 
 def optimize(level: str = "safe", verbose: bool = True):
@@ -41,11 +31,11 @@ def optimize(level: str = "safe", verbose: bool = True):
     _state["level"] = level
     _state["applied"] = 0
 
-    _s(info)
+    _apply_safe(info)
     if level in ("fast", "max"):
-        _f(info)
+        _apply_fast(info)
     if level == "max":
-        _m(info)
+        _apply_max(info)
 
     if verbose:
         print(f"[torch-continuum] {info.device_name}")
@@ -62,42 +52,38 @@ def status():
     print(f"  optimizations applied: {_state['applied']}")
 
 
-def _r(attr, val=True):
-    parts = attr.split(".")
-    obj = _t
-    for p in parts[:-1]:
-        obj = getattr(obj, p)
-    if callable(getattr(obj, parts[-1], None)):
-        getattr(obj, parts[-1])(val)
-    else:
-        setattr(obj, parts[-1], val)
-
-
-def _s(info):
+def _apply_safe(info: DeviceInfo):
+    """No precision change. Algorithmic and scheduling improvements only."""
     if info.device_type == "cuda":
-        _r(_P[0])
+        torch.backends.cudnn.benchmark = True
         _state["applied"] += 1
+
         if info.accel_attn:
-            _r(_P[1])
-            _r(_P[2])
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
             _state["applied"] += 1
-        _os.environ.setdefault(_E[0], _E[1])
+
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         _state["applied"] += 1
 
 
-def _f(info):
+def _apply_fast(info: DeviceInfo):
+    """Enable accelerated matmul on supported hardware (Ampere+)."""
     if info.device_type == "cuda" and info.accel_matmul:
-        _r(_P[3])
-        _r(_P[4])
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         _state["applied"] += 1
 
 
-def _m(info):
+def _apply_max(info: DeviceInfo):
+    """Mixed precision, fused kernels, graph compilation."""
     if info.device_type == "cuda" and info.accel_mixed:
         _state["applied"] += 1
+
     from .kernels import apply_liger_kernels, liger_available
     if liger_available():
         apply_liger_kernels()
         _state["applied"] += 1
-    if hasattr(_t, "compile"):
+
+    if hasattr(torch, "compile"):
         _state["applied"] += 1

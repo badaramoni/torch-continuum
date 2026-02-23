@@ -1,4 +1,7 @@
-"""Hardware detection engine."""
+"""Hardware detection engine.
+
+Detects GPU type, compute capability, and supported acceleration features.
+"""
 
 import torch
 from dataclasses import dataclass
@@ -12,32 +15,33 @@ class DeviceInfo:
     compute_capability: Tuple[int, int] = (0, 0)
     memory_gb: float = 0.0
     cuda_version: str = "N/A"
-    _cap_a: bool = False
-    _cap_b: bool = False
-    _cap_c: bool = False
-    _cap_d: bool = False
+    supports_tf32: bool = False
+    supports_bf16: bool = False
+    supports_fp8: bool = False
+    supports_flash_attn: bool = False
     num_devices: int = 1
 
     @property
     def accel_matmul(self):
-        return self._cap_a
+        return self.supports_tf32
 
     @property
     def accel_mixed(self):
-        return self._cap_b
+        return self.supports_bf16
 
     @property
     def accel_fp8(self):
-        return self._cap_c
+        return self.supports_fp8
 
     @property
     def accel_attn(self):
-        return self._cap_d
+        return self.supports_flash_attn
 
     def summary(self) -> str:
         lines = [f"  device : {self.device_name} ({self.device_type})"]
         if self.device_type == "cuda":
             lines.append(f"  memory : {self.memory_gb:.1f} GB  |  GPUs: {self.num_devices}")
+            lines.append(f"  compute: {self.compute_capability[0]}.{self.compute_capability[1]}")
         return "\n".join(lines)
 
 
@@ -53,10 +57,10 @@ def detect_device() -> DeviceInfo:
             compute_capability=cc,
             memory_gb=props.total_memory / 1e9,
             cuda_version=torch.version.cuda or "unknown",
-            _cap_a=cc >= (8, 0),
-            _cap_b=cc >= (8, 0),
-            _cap_c=cc >= (8, 9),
-            _cap_d=cc >= (8, 0),
+            supports_tf32=cc >= (8, 0),
+            supports_bf16=cc >= (8, 0),
+            supports_fp8=cc >= (8, 9),
+            supports_flash_attn=cc >= (8, 0),
             num_devices=torch.cuda.device_count(),
         )
 
@@ -64,7 +68,7 @@ def detect_device() -> DeviceInfo:
         return DeviceInfo(
             device_type="mps",
             device_name="Apple Silicon (MPS)",
-            _cap_b=True,
+            supports_bf16=True,
         )
 
     return DeviceInfo(device_type="cpu", device_name="CPU")
